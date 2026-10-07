@@ -17,6 +17,10 @@ class ClaimVerify(BaseModel):
     status: ClaimStatus # APPROVED or REJECTED
     officer_notes: Optional[str] = None
 
+class ClaimHandover(BaseModel):
+    verification_code: str
+    handover_notes: Optional[str] = None
+
 class ClaimOut(BaseModel):
     id: str
     found_item_id: str
@@ -29,9 +33,14 @@ class ClaimOut(BaseModel):
     officer_notes: Optional[str] = None
     created_at: datetime
     resolved_at: Optional[datetime] = None
+    handover_code: Optional[str] = None
+    handed_over_at: Optional[datetime] = None
+    handover_officer_id: Optional[str] = None
+    handover_notes: Optional[str] = None
     found_item: Optional[ItemOut] = None
     lost_item: Optional[ItemOut] = None
     claimant: Optional[UserOut] = None
     verifier: Optional[UserOut] = None
+    handover_officer: Optional[UserOut] = None
 
     model_config = ConfigDict(from_attributes=True)

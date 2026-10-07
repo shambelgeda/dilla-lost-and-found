@@ -12,24 +12,16 @@ from app.models.user import User, UserRole
 from app.models.location import CampusLocation
 from app.models.category import Category
 from app.models.audit import AuditLog
+from app.models.match import Match
+from app.models.claim import Claim
+from app.models.notification import Notification
 from app.schemas.item import ItemOut, ItemFilter, ItemUpdate
 from app.services.auth import get_current_user, get_current_user_optional, require_roles
 from app.services.ai_engine import run_matching_engine_for_item, process_and_store_embedding
 from app.services.notification import send_match_notification
+from app.services.privacy import sanitize_item_out
 
 router = APIRouter(prefix="/items", tags=["Lost & Found Items"])
-
-def sanitize_item_out(item: Item, current_user: Optional[User]) -> ItemOut:
-    """Mask confidential identifiers if the viewer is neither the owner nor an officer/admin."""
-    out = ItemOut.model_validate(item)
-    is_owner = current_user and current_user.id == item.user_id
-    is_staff_or_admin = current_user and current_user.role in [UserRole.SECURITY_OFFICER, UserRole.ADMIN]
-    
-    if not (is_owner or is_staff_or_admin):
-        out.confidential_identifiers = None
-    for image in out.images:
-        image.file_path = f"/uploads/{os.path.basename(image.file_path)}"
-    return out
 
 @router.post("", response_model=ItemOut, status_code=status.HTTP_201_CREATED)
 async def report_item(
@@ -233,6 +225,28 @@ def delete_item(
     is_staff_or_admin = current_user.role in [UserRole.SECURITY_OFFICER, UserRole.ADMIN]
     if not (is_owner or is_staff_or_admin):
         raise HTTPException(status_code=403, detail="Not allowed to delete this item")
+
+    # 1. Clean up associated Match records
+    db.query(Match).filter(
+        (Match.lost_item_id == item_id) | (Match.found_item_id == item_id)
+    ).delete(synchronize_session=False)
+
+    # 2. Clean up associated Claim records
+    db.query(Claim).filter(Claim.lost_item_id == item_id).update(
+        {Claim.lost_item_id: None}, synchronize_session=False
+    )
+    db.query(Claim).filter(Claim.found_item_id == item_id).delete(synchronize_session=False)
+
+    # 3. Clean up associated notifications
+    db.query(Notification).filter(Notification.related_id == item_id).delete(synchronize_session=False)
+
+    # 4. Remove physical upload files if present
+    for img in item.images:
+        if img.file_path and os.path.exists(img.file_path):
+            try:
+                os.remove(img.file_path)
+            except OSError:
+                pass
 
     db.delete(item)
     db.commit()

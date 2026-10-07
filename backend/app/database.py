@@ -20,6 +20,23 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
+def sync_database_schema(db_engine):
+    """Ensure missing columns on existing tables are added automatically."""
+    from sqlalchemy import inspect, text
+    inspector = inspect(db_engine)
+    if "claims" in inspector.get_table_names():
+        claim_cols = {c["name"] for c in inspector.get_columns("claims")}
+        with db_engine.connect() as conn:
+            if "handover_code" not in claim_cols:
+                conn.execute(text("ALTER TABLE claims ADD COLUMN handover_code VARCHAR(50)"))
+            if "handed_over_at" not in claim_cols:
+                conn.execute(text("ALTER TABLE claims ADD COLUMN handed_over_at DATETIME"))
+            if "handover_officer_id" not in claim_cols:
+                conn.execute(text("ALTER TABLE claims ADD COLUMN handover_officer_id VARCHAR"))
+            if "handover_notes" not in claim_cols:
+                conn.execute(text("ALTER TABLE claims ADD COLUMN handover_notes TEXT"))
+            conn.commit()
+
 def get_db():
     db = SessionLocal()
     try:

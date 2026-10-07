@@ -20,6 +20,9 @@ class UserLogin(BaseModel):
     university_id_or_email: str
     password: str
 
+class UserRoleUpdate(BaseModel):
+    role: UserRole
+
 class UserOut(UserBase):
     id: str
     is_active: bool

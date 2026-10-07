@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 
 from app.config import settings
-from app.database import Base, engine, SessionLocal
+from app.database import Base, engine, SessionLocal, sync_database_schema
 from app.routers import (
     analytics_router,
     auth_router,
@@ -20,8 +20,9 @@ from app.routers import (
 from app.seed_data import seed_database
 from app.services.ai_engine import refresh_stale_embeddings_and_matches
 
-# Create tables in database
+# Create tables in database and sync schema additions
 Base.metadata.create_all(bind=engine)
+sync_database_schema(engine)
 
 
 @asynccontextmanager

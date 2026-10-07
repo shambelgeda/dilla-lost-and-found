@@ -9,6 +9,7 @@ class ClaimStatus(str, enum.Enum):
     UNDER_REVIEW = "UNDER_REVIEW"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    HANDED_OVER = "HANDED_OVER"
 
 class Claim(Base):
     __tablename__ = "claims"
@@ -25,7 +26,14 @@ class Claim(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     resolved_at = Column(DateTime, nullable=True)
 
+    # Physical Custody Handover Verification
+    handover_code = Column(String(50), nullable=True, index=True)
+    handed_over_at = Column(DateTime, nullable=True)
+    handover_officer_id = Column(String, ForeignKey("users.id"), nullable=True)
+    handover_notes = Column(Text, nullable=True)
+
     found_item = relationship("Item", foreign_keys=[found_item_id])
     lost_item = relationship("Item", foreign_keys=[lost_item_id])
     claimant = relationship("User", foreign_keys=[claimant_id])
     verifier = relationship("User", foreign_keys=[verified_by])
+    handover_officer = relationship("User", foreign_keys=[handover_officer_id])

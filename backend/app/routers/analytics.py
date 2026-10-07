@@ -44,7 +44,9 @@ def get_overview_analytics(
     total_lost = db.query(Item).filter(Item.report_type == ItemType.LOST).count()
     total_found = db.query(Item).filter(Item.report_type == ItemType.FOUND).count()
     total_matches = db.query(Match).count()
-    total_approved_claims = db.query(Claim).filter(Claim.status == ClaimStatus.APPROVED).count()
+    total_approved_claims = db.query(Claim).filter(
+        Claim.status.in_([ClaimStatus.APPROVED, ClaimStatus.HANDED_OVER])
+    ).count()
     
     recovery_rate = (total_approved_claims / max(1, total_lost)) * 100.0
 
@@ -132,7 +134,7 @@ def get_monthly_trends(
             func.strftime("%Y-%m", Claim.created_at).label("month"),
             func.count(Claim.id).label("count")
         ).filter(
-            Claim.status == ClaimStatus.APPROVED,
+            Claim.status.in_([ClaimStatus.APPROVED, ClaimStatus.HANDED_OVER]),
             Claim.created_at >= lower_bound
         ).group_by("month").all()
     }

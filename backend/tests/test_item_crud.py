@@ -6,12 +6,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.config import settings
-from app.database import Base, get_db
+from app.database import Base, get_db, sync_database_schema
 from app.main import app
 from app.models.category import Category
 from app.models.claim import Claim, ClaimStatus
 from app.models.item import Item, ItemType, ItemStatus
 from app.models.location import CampusLocation
+from app.models.match import Match, MatchStatus
 from app.models.notification import Notification
 from app.models.user import User, UserRole
 from app.services.auth import create_access_token, get_password_hash
@@ -22,6 +23,7 @@ if os.path.exists("/tmp/dilla_lost_found_test.db"):
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
+sync_database_schema(engine)
 
 
 def override_get_db():
@@ -34,6 +36,84 @@ def override_get_db():
 
 app.dependency_overrides[get_db] = override_get_db
 client = TestClient(app)
+
+
+def test_public_registration_cannot_assign_privileged_role():
+    response = client.post(
+        f"{settings.API_V1_STR}/auth/register",
+        json={
+            "university_id": "DU/R/9001/14",
+            "full_name": "New Student",
+            "email": "new.student.9001@du.edu.et",
+            "password": "safe-password-123",
+            "role": "ADMIN",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["user"]["role"] == UserRole.STUDENT.value
+
+
+def test_admin_can_provision_roles_but_students_cannot_manage_accounts():
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+
+    db = TestingSessionLocal()
+    try:
+        admin = User(
+            id="usr-role-admin",
+            university_id="DU/ADM/ROLE",
+            full_name="Role Admin",
+            email="role.admin@du.edu.et",
+            role=UserRole.ADMIN,
+            hashed_password=get_password_hash("password123"),
+            is_active=True,
+            created_at=datetime.now(timezone.utc),
+        )
+        student = User(
+            id="usr-role-student",
+            university_id="DU/R/ROLE/14",
+            full_name="Role Student",
+            email="role.student@du.edu.et",
+            role=UserRole.STUDENT,
+            hashed_password=get_password_hash("password123"),
+            is_active=True,
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add_all([admin, student])
+        db.commit()
+        admin_token = create_access_token({"sub": admin.id, "role": admin.role.value})
+        student_token = create_access_token({"sub": student.id, "role": student.role.value})
+    finally:
+        db.close()
+
+    student_headers = {"Authorization": f"Bearer {student_token}"}
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    assert client.get(f"{settings.API_V1_STR}/auth/users", headers=student_headers).status_code == 403
+    assert client.patch(
+        f"{settings.API_V1_STR}/auth/users/usr-role-student/role",
+        json={"role": "SECURITY_OFFICER"},
+        headers=student_headers,
+    ).status_code == 403
+
+    listing = client.get(f"{settings.API_V1_STR}/auth/users", headers=admin_headers)
+    assert listing.status_code == 200
+    assert all("hashed_password" not in account for account in listing.json())
+
+    promotion = client.patch(
+        f"{settings.API_V1_STR}/auth/users/usr-role-student/role",
+        json={"role": "SECURITY_OFFICER"},
+        headers=admin_headers,
+    )
+    assert promotion.status_code == 200
+    assert promotion.json()["role"] == UserRole.SECURITY_OFFICER.value
+
+    self_demotion = client.patch(
+        f"{settings.API_V1_STR}/auth/users/usr-role-admin/role",
+        json={"role": "STUDENT"},
+        headers=admin_headers,
+    )
+    assert self_demotion.status_code == 400
 
 
 def seed_test_data():
@@ -441,3 +521,282 @@ def test_user_can_get_unread_count_and_mark_all_notifications_read():
     payload = mark_all.json()
     assert payload["updated_count"] == 1
     assert payload["unread_count"] == 0
+
+
+def setup_privacy_test_data():
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    sync_database_schema(engine)
+
+    db = TestingSessionLocal()
+    try:
+        pw = get_password_hash("password123")
+        student1 = User(
+            id="usr-s1",
+            university_id="DU/R/1001/14",
+            full_name="Abebe Student",
+            email="abebe@du.edu.et",
+            role=UserRole.STUDENT,
+            hashed_password=pw,
+            is_active=True,
+        )
+        student2 = User(
+            id="usr-s2",
+            university_id="DU/R/1002/14",
+            full_name="Tigist Student",
+            email="tigist@du.edu.et",
+            role=UserRole.STUDENT,
+            hashed_password=pw,
+            is_active=True,
+        )
+        student3 = User(
+            id="usr-s3",
+            university_id="DU/R/1003/14",
+            full_name="Stranger Student",
+            email="stranger@du.edu.et",
+            role=UserRole.STUDENT,
+            hashed_password=pw,
+            is_active=True,
+        )
+        officer = User(
+            id="usr-off1",
+            university_id="DU/SEC/001",
+            full_name="Officer Chala",
+            email="chala@du.edu.et",
+            role=UserRole.SECURITY_OFFICER,
+            hashed_password=pw,
+            is_active=True,
+        )
+        loc = CampusLocation(
+            id="loc-lib",
+            campus_name="Main Campus",
+            block_or_facility="Library",
+            floor_or_room="1st Floor",
+        )
+        cat = Category(
+            id="cat-elec",
+            name="Electronics",
+            description="Laptops and devices",
+        )
+        lost_item = Item(
+            id="itm-lost-01",
+            user_id=student1.id,
+            report_type=ItemType.LOST,
+            title="Black HP Laptop",
+            description="Lost my HP laptop in library",
+            category_id=cat.id,
+            location_id=loc.id,
+            incident_date=datetime.now(timezone.utc),
+            status=ItemStatus.OPEN,
+            confidential_identifiers="Abebe-Secret-Serial-1234",
+            created_at=datetime.now(timezone.utc),
+        )
+        found_item = Item(
+            id="itm-found-01",
+            user_id=officer.id,
+            report_type=ItemType.FOUND,
+            title="HP Pavilion Laptop",
+            description="Found black laptop in library desk 4",
+            category_id=cat.id,
+            location_id=loc.id,
+            incident_date=datetime.now(timezone.utc),
+            status=ItemStatus.OPEN,
+            confidential_identifiers="Officer-Secret-Serial-1234-Sticker",
+            created_at=datetime.now(timezone.utc),
+        )
+        match = Match(
+            id="mat-01",
+            lost_item_id=lost_item.id,
+            found_item_id=found_item.id,
+            image_score=0.0,
+            text_score=0.88,
+            meta_score=0.90,
+            final_score=0.88,
+            status=MatchStatus.SUGGESTED,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        db.add_all([student1, student2, student3, officer, loc, cat, lost_item, found_item, match])
+        db.commit()
+
+        token_s1 = create_access_token({"sub": student1.id, "role": student1.role.value})
+        token_s2 = create_access_token({"sub": student2.id, "role": student2.role.value})
+        token_s3 = create_access_token({"sub": student3.id, "role": student3.role.value})
+        token_off = create_access_token({"sub": officer.id, "role": officer.role.value})
+
+        return token_s1, token_s2, token_s3, token_off
+    finally:
+        db.close()
+
+
+def test_student_cannot_see_confidential_identifiers_of_matched_found_item():
+    token_s1, _, _, token_off = setup_privacy_test_data()
+
+    res = client.get(
+        f"{settings.API_V1_STR}/matches/my-matches",
+        headers={"Authorization": f"Bearer {token_s1}"},
+    )
+    assert res.status_code == 200
+    matches = res.json()
+    assert len(matches) == 1
+    m = matches[0]
+
+    assert m["lost_item"]["confidential_identifiers"] == "Abebe-Secret-Serial-1234"
+    assert m["found_item"]["confidential_identifiers"] is None
+
+    res_off = client.get(
+        f"{settings.API_V1_STR}/matches/review-queue",
+        headers={"Authorization": f"Bearer {token_off}"},
+    )
+    assert res_off.status_code == 200
+    matches_off = res_off.json()
+    assert len(matches_off) == 1
+    m_off = matches_off[0]
+    assert m_off["lost_item"]["confidential_identifiers"] == "Abebe-Secret-Serial-1234"
+    assert m_off["found_item"]["confidential_identifiers"] == "Officer-Secret-Serial-1234-Sticker"
+
+
+def test_match_detail_access_control():
+    token_s1, _, token_s3, token_off = setup_privacy_test_data()
+
+    res = client.get(
+        f"{settings.API_V1_STR}/matches/mat-01",
+        headers={"Authorization": f"Bearer {token_s1}"},
+    )
+    assert res.status_code == 200
+
+    res = client.get(
+        f"{settings.API_V1_STR}/matches/mat-01",
+        headers={"Authorization": f"Bearer {token_off}"},
+    )
+    assert res.status_code == 200
+
+    res = client.get(
+        f"{settings.API_V1_STR}/matches/mat-01",
+        headers={"Authorization": f"Bearer {token_s3}"},
+    )
+    assert res.status_code == 403
+
+
+def test_only_item_owner_or_staff_can_trigger_ai_matching():
+    token_s1, _, token_s3, token_off = setup_privacy_test_data()
+
+    res = client.post(
+        f"{settings.API_V1_STR}/matches/trigger/itm-lost-01",
+        headers={"Authorization": f"Bearer {token_s1}"},
+    )
+    assert res.status_code == 200
+
+    res = client.post(
+        f"{settings.API_V1_STR}/matches/trigger/itm-lost-01",
+        headers={"Authorization": f"Bearer {token_s3}"},
+    )
+    assert res.status_code == 403
+
+    res = client.post(
+        f"{settings.API_V1_STR}/matches/trigger/itm-lost-01",
+        headers={"Authorization": f"Bearer {token_off}"},
+    )
+    assert res.status_code == 200
+
+
+def test_item_deletion_succeeds_even_with_associated_matches_and_claims():
+    token_s1, _, _, _ = setup_privacy_test_data()
+
+    res = client.delete(
+        f"{settings.API_V1_STR}/items/itm-lost-01",
+        headers={"Authorization": f"Bearer {token_s1}"},
+    )
+    assert res.status_code == 200
+    assert res.json()["item_id"] == "itm-lost-01"
+
+    db = TestingSessionLocal()
+    try:
+        assert db.query(Item).filter(Item.id == "itm-lost-01").first() is None
+        assert db.query(Match).filter(Match.lost_item_id == "itm-lost-01").first() is None
+    finally:
+        db.close()
+
+
+def test_physical_custody_handover_workflow():
+    token_s1, token_s2, _, token_off = setup_privacy_test_data()
+
+    # 1. Student 1 submits Claim A
+    claim_a_res = client.post(
+        f"{settings.API_V1_STR}/claims",
+        json={
+            "found_item_id": "itm-found-01",
+            "lost_item_id": "itm-lost-01",
+            "proof_description": "My laptop has an Octocat sticker and serial ending 1234.",
+        },
+        headers={"Authorization": f"Bearer {token_s1}"},
+    )
+    assert claim_a_res.status_code == 201
+    claim_a_id = claim_a_res.json()["id"]
+
+    # 2. Student 2 submits Claim B (competing claim)
+    claim_b_res = client.post(
+        f"{settings.API_V1_STR}/claims",
+        json={
+            "found_item_id": "itm-found-01",
+            "proof_description": "I think it is my laptop.",
+        },
+        headers={"Authorization": f"Bearer {token_s2}"},
+    )
+    assert claim_b_res.status_code == 201
+    claim_b_id = claim_b_res.json()["id"]
+
+    # 3. Officer verifies and APPROVES Claim A
+    verify_res = client.patch(
+        f"{settings.API_V1_STR}/claims/{claim_a_id}/verify",
+        json={"status": "APPROVED", "officer_notes": "Serial number matches perfectly."},
+        headers={"Authorization": f"Bearer {token_off}"},
+    )
+    assert verify_res.status_code == 200
+    claim_a_approved = verify_res.json()
+    assert claim_a_approved["status"] == "APPROVED"
+    assert claim_a_approved["handover_code"] is not None
+    assert claim_a_approved["handover_code"].startswith("DU-")
+    handover_code = claim_a_approved["handover_code"]
+
+    # 4. Verify competing Claim B was automatically rejected
+    claim_b_fetch = client.get(
+        f"{settings.API_V1_STR}/claims/{claim_b_id}",
+        headers={"Authorization": f"Bearer {token_s2}"},
+    )
+    assert claim_b_fetch.status_code == 200
+    assert claim_b_fetch.json()["status"] == "REJECTED"
+
+    # 5. Student cannot call the officer handover endpoint
+    student_attempt = client.post(
+        f"{settings.API_V1_STR}/claims/{claim_a_id}/handover",
+        json={"verification_code": handover_code},
+        headers={"Authorization": f"Bearer {token_s1}"},
+    )
+    assert student_attempt.status_code == 403
+
+    # 6. Officer supplies WRONG code
+    bad_code_attempt = client.post(
+        f"{settings.API_V1_STR}/claims/{claim_a_id}/handover",
+        json={"verification_code": "DU-WRONG99"},
+        headers={"Authorization": f"Bearer {token_off}"},
+    )
+    assert bad_code_attempt.status_code == 400
+    assert "invalid physical handover verification code" in bad_code_attempt.json()["detail"].lower()
+
+    # 7. Officer supplies CORRECT code -> Physical handover succeeds!
+    handover_res = client.post(
+        f"{settings.API_V1_STR}/claims/{claim_a_id}/handover",
+        json={
+            "verification_code": handover_code,
+            "handover_notes": "Student verified with ID DU/R/1001/14. Physical laptop handed over.",
+        },
+        headers={"Authorization": f"Bearer {token_off}"},
+    )
+    assert handover_res.status_code == 200
+    handover_payload = handover_res.json()
+    assert handover_payload["status"] == "HANDED_OVER"
+    assert handover_payload["handed_over_at"] is not None
+    assert handover_payload["handover_officer_id"] == "usr-off1"
+    assert handover_payload["handover_notes"] == "Student verified with ID DU/R/1001/14. Physical laptop handed over."
+

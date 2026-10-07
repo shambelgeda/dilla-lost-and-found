@@ -6,11 +6,13 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.claim import Claim, ClaimStatus
 from app.models.item import Item, ItemStatus, ItemType
+from app.models.match import Match, MatchStatus
 from app.models.user import User, UserRole
 from app.models.audit import AuditLog
-from app.schemas.claim import ClaimCreate, ClaimVerify, ClaimOut
+from app.schemas.claim import ClaimCreate, ClaimVerify, ClaimHandover, ClaimOut
 from app.services.auth import get_current_user, require_roles
-from app.services.notification import send_claim_update_notification
+from app.services.notification import send_claim_update_notification, create_notification
+from app.services.privacy import sanitize_claim_out
 
 router = APIRouter(prefix="/claims", tags=["Ownership Claims & Verification"])
 
@@ -75,7 +77,7 @@ def submit_claim(
     db.add(audit)
     db.commit()
     db.refresh(claim)
-    return claim
+    return sanitize_claim_out(claim, current_user)
 
 @router.get("", response_model=List[ClaimOut])
 def list_claims(
@@ -90,7 +92,8 @@ def list_claims(
     if current_user.role in [UserRole.STUDENT, UserRole.STAFF]:
         query = query.filter(Claim.claimant_id == current_user.id)
 
-    return query.order_by(Claim.created_at.desc()).all()
+    claims = query.order_by(Claim.created_at.desc()).all()
+    return [sanitize_claim_out(c, current_user) for c in claims]
 
 @router.get("/{claim_id}", response_model=ClaimOut)
 def get_claim(
@@ -107,7 +110,7 @@ def get_claim(
     if not (is_claimant or is_officer):
         raise HTTPException(status_code=403, detail="Unauthorized to view this claim")
 
-    return claim
+    return sanitize_claim_out(claim, current_user)
 
 @router.patch("/{claim_id}/verify", response_model=ClaimOut)
 def verify_claim(
@@ -127,16 +130,53 @@ def verify_claim(
 
     found_item = claim.found_item
     if verify_data.status == ClaimStatus.APPROVED:
+        # Generate 6-character secure pickup verification code
+        claim.handover_code = f"DU-{uuid.uuid4().hex[:6].upper()}"
+
         # Mark found item as RESOLVED
         found_item.status = ItemStatus.RESOLVED
+
         # If there was a linked lost item, mark it RESOLVED too
         if claim.lost_item_id:
             lost_item = db.query(Item).filter(Item.id == claim.lost_item_id).first()
             if lost_item:
                 lost_item.status = ItemStatus.RESOLVED
+
+            # Also update match status to CONFIRMED
+            match_rec = db.query(Match).filter(
+                Match.lost_item_id == claim.lost_item_id,
+                Match.found_item_id == found_item.id
+            ).first()
+            if match_rec:
+                match_rec.status = MatchStatus.CONFIRMED
+
+        # Reconcile any other pending claims for this found item
+        competing_claims = db.query(Claim).filter(
+            Claim.found_item_id == found_item.id,
+            Claim.id != claim.id,
+            Claim.status.in_([ClaimStatus.SUBMITTED, ClaimStatus.UNDER_REVIEW])
+        ).all()
+        for c in competing_claims:
+            c.status = ClaimStatus.REJECTED
+            c.officer_notes = "Another ownership claim was approved for this item."
+            c.resolved_at = datetime.now(timezone.utc)
+            c.verified_by = current_user.id
+            if c.claimant:
+                send_claim_update_notification(
+                    claim_status="REJECTED",
+                    claimant=c.claimant,
+                    item_title=found_item.title,
+                    remarks=c.officer_notes,
+                    db=db,
+                )
     else:
-        # Revert found item back to OPEN if no other approved claim
-        found_item.status = ItemStatus.OPEN
+        # Revert found item: check if there are other pending claims
+        remaining_pending = db.query(Claim).filter(
+            Claim.found_item_id == found_item.id,
+            Claim.id != claim.id,
+            Claim.status.in_([ClaimStatus.SUBMITTED, ClaimStatus.UNDER_REVIEW])
+        ).count()
+        found_item.status = ItemStatus.CLAIM_PENDING if remaining_pending > 0 else ItemStatus.OPEN
 
     # Audit log
     audit = AuditLog(
@@ -151,14 +191,83 @@ def verify_claim(
     db.commit()
     db.refresh(claim)
 
-    # Send Notification to claimant
+    # Send Notification to claimant with pickup code instructions if approved
     if claim.claimant:
+        remarks = verify_data.officer_notes or "Proof verified by officer."
+        if verify_data.status == ClaimStatus.APPROVED and claim.handover_code:
+            remarks += f"\nYour Physical Pickup Verification Code is: {claim.handover_code}. Please present this code and your Student ID at the Security Office."
+
         send_claim_update_notification(
             claim_status=verify_data.status.value,
             claimant=claim.claimant,
             item_title=found_item.title,
-            remarks=verify_data.officer_notes,
+            remarks=remarks,
             db=db,
         )
 
-    return claim
+    return sanitize_claim_out(claim, current_user)
+
+@router.post("/{claim_id}/handover", response_model=ClaimOut)
+def confirm_physical_handover(
+    claim_id: str,
+    handover_data: ClaimHandover,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.SECURITY_OFFICER, UserRole.ADMIN))
+):
+    """
+    Physical handover verification: Officer verifies student's university ID and checks the 6-character
+    verification pickup code before transferring custody of the found item.
+    """
+    claim = db.query(Claim).filter(Claim.id == claim_id).first()
+    if not claim:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    if claim.status != ClaimStatus.APPROVED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only approved claims can be physically handed over. Current status: {claim.status.value}"
+        )
+
+    submitted_code = handover_data.verification_code.strip().upper()
+    if not claim.handover_code or submitted_code != claim.handover_code.upper():
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid physical handover verification code. Please confirm code on student's portal."
+        )
+
+    claim.status = ClaimStatus.HANDED_OVER
+    claim.handed_over_at = datetime.now(timezone.utc)
+    claim.handover_officer_id = current_user.id
+    claim.handover_notes = handover_data.handover_notes
+
+    found_item = claim.found_item
+    found_item.status = ItemStatus.RESOLVED
+
+    audit = AuditLog(
+        id=f"aud-{uuid.uuid4().hex[:8]}",
+        actor_id=current_user.id,
+        action="PHYSICAL_HANDOVER_COMPLETED",
+        target_entity="claims",
+        target_id=claim_id,
+        details=f"Item '{found_item.title}' handed over to claimant {claim.claimant.full_name} ({claim.claimant.university_id})"
+    )
+    db.add(audit)
+    db.commit()
+    db.refresh(claim)
+
+    if claim.claimant:
+        create_notification(
+            db=db,
+            user=claim.claimant,
+            title="Physical Handover Completed",
+            message=(
+                f"✅ Physical handover complete! Your item '{found_item.title}' has been successfully handed over "
+                f"to you at the Campus Security Office by Officer {current_user.full_name}. Thank you for using "
+                f"the Dilla University Lost & Found system."
+            ),
+            notification_type="HANDOVER",
+            related_entity="claims",
+            related_id=claim.id
+        )
+
+    return sanitize_claim_out(claim, current_user)
