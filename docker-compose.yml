@@ -1,0 +1,61 @@
+version: '3.9'
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dilla_lost_found
+      POSTGRES_USER: dilla
+      POSTGRES_PASSWORD: dilla_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://dilla:dilla_pass@db:5432/dilla_lost_found
+    depends_on:
+      - db
+    expose:
+      - "8000"
+    volumes:
+      - ./backend:/app
+      - ./backend/uploads:/app/uploads
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      - backend
+    command: >
+      sh -lc "npm install && npm run build && mkdir -p /dist && cp -R dist/. /dist && sleep infinity"
+    volumes:
+      - frontend_dist:/dist
+    restart: unless-stopped
+
+  proxy:
+    image: nginx:1.27-alpine
+    depends_on:
+      - backend
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - frontend_dist:/usr/share/nginx/html:ro
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  frontend_dist:

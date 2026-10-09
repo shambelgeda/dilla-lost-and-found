@@ -30,6 +30,10 @@ build/
 # Logs
 *.log
 
+# TLS / local reverse proxy certs
+nginx/certs/*.crt
+nginx/certs/*.key
+
 # OS
 .DS_Store
 Thumbs.db

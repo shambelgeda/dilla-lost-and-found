@@ -58,6 +58,14 @@ app.add_middleware(
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
 
+frontend_dist = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "frontend",
+    "dist",
+)
+if os.path.isdir(frontend_dist):
+    app.mount("/app", StaticFiles(directory=frontend_dist, html=True), name="frontend")
+
 # Include Routers
 app.include_router(auth_router, prefix=settings.API_V1_STR)
 app.include_router(locations_router, prefix=settings.API_V1_STR)
